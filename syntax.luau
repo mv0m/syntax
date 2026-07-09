@@ -5,6 +5,7 @@ local Workspace  = game:GetService("Workspace")
 local CoreGui    = game:GetService("CoreGui")
 local Lighting   = game:GetService("Lighting")
 local Tween      = game:GetService("TweenService")
+local GuiService = game:GetService("GuiService")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -17,12 +18,12 @@ local Hub = {}; if getgenv then getgenv().syntax = Hub end
 local F = {
     Aim = { On=false, Held=false, Part="Head", TeamCheck=true, WallCheck=false, Smooth=0.20, FOV=120, ShowFOV=true, Predict=0.0, Trigger=false, TrigDelay=60, Silent=false, Fire=false },
     ESP = { On=false, Box=true, Filled=false, Name=true, Dist=true, Health=true, Tracer=false, Skeleton=false, EnemiesOnly=false },
-    Mov = { Speed=false, SpeedV=50, JumpOn=false, JumpV=80, Fly=false, FlyV=2.5, Noclip=false, InfJump=false },
+    Mov = { Speed=false, SpeedV=50, JumpOn=false, JumpV=80, Fly=false, FlyV=2.5, Noclip=false, InfJump=false, Invis=false },
     Wld = { Fullbright=false, NoFog=false, FOV=70, AntiAFK=false },
     UI  = { Boxes=true, RGB=false },
 }
 Hub.F = F
-local attached = false
+local attached = true   -- features are always live; the old manual "Attach" step was removed
 local conns = {}
 local function bind(s,f) local c=s:Connect(f); conns[#conns+1]=c; return c end
 
@@ -32,6 +33,29 @@ local function root() local c=char(); return c and (c:FindFirstChild("HumanoidRo
 local function hum()  local c=char(); return c and c:FindFirstChildOfClass("Humanoid") end
 local function alive(p) local c=p.Character; local h=c and c:FindFirstChildOfClass("Humanoid"); return h and h.Health>0, c, h end
 local function key(k) return UIS:IsKeyDown(k) end
+-- crosshair origin for aim: the MOUSE position. Prison Life aims the gun at the cursor
+-- (ViewportPointToRay), so the FOV circle + target selection track the mouse, not screen center.
+-- Drawing + WorldToViewportPoint share GetMouseLocation's origin, so use it directly — subtracting
+-- the GUI inset (the old code) pushed the circle ~36px above the cursor.
+local function aimOrigin()
+    return UIS:GetMouseLocation()
+end
+-- smooth (tweened) teleport: glide the root to the target over `dur` on Heartbeat (post-physics, so
+-- it replicates) instead of snapping. Zeroing velocity keeps physics from fighting the slide.
+local function tweenTP(cf, dur)
+    local r=root(); if not (r and cf) then return end
+    dur=dur or 0.22
+    local startCF=r.CFrame; local t0=os.clock()
+    while true do
+        local a=(os.clock()-t0)/dur
+        if a>=1 then break end
+        a=1-(1-a)*(1-a)  -- ease-out
+        pcall(function() r.CFrame=startCF:Lerp(cf,a); r.AssemblyLinearVelocity=Vector3.zero end)
+        RunService.Heartbeat:Wait()
+    end
+    pcall(function() r.CFrame=cf; r.AssemblyLinearVelocity=Vector3.zero end)
+end
+local function tpMove(cf) if cf then task.spawn(tweenTP,cf,0.22) end end
 local ENEMY_MODES={"Enemy team","Cops (Guards)","Criminals","Everyone"}
 local enemyMode=1
 local function isEnemy(p)
@@ -51,7 +75,7 @@ do
         return (not r) or r.Instance:IsDescendantOf(part.Parent)
     end
     function Aim.getTarget(maxFov, needLos)
-        local best,bd=nil,maxFov or F.Aim.FOV; local center=cam().ViewportSize/2
+        local best,bd=nil,maxFov or F.Aim.FOV; local center=aimOrigin()
         for _,p in ipairs(Players:GetPlayers()) do
             if p~=LocalPlayer and isEnemy(p) then
                 local ok,c=alive(p); local part=ok and c:FindFirstChild(F.Aim.Part)
@@ -70,11 +94,11 @@ local function fireClick()
     elseif mouse1click then pcall(mouse1click) end
 end
 
--- wallbang = aim-lock through walls (nearest on-screen enemy ignoring line-of-sight).
--- NO gun/remote hook: hooking this game's fire remote breaks the gun on Opiumware, so we never touch it.
+-- wallbang = camera aim-lock through walls (nearest on-screen enemy ignoring line-of-sight).
+-- wallbang itself never touches the gun remote; only silent aim hooks ShootEvent (safely) below.
 local wallbang=false
 local function wallTarget()
-    local best,bd=nil,F.Aim.FOV; local center=cam().ViewportSize/2
+    local best,bd=nil,F.Aim.FOV; local center=aimOrigin()
     for _,p in ipairs(Players:GetPlayers()) do
         if p~=LocalPlayer and isEnemy(p) then local ok,c=alive(p); local part=ok and c:FindFirstChild(F.Aim.Part)
             if part then local sp,on=cam():WorldToViewportPoint(part.Position)
@@ -85,34 +109,237 @@ local function wallTarget()
 end
 if getgenv then getgenv().syntax_wall=false end
 
--- silent aim fires this remote DIRECTLY (never hooks it) → cannot break the gun.
--- shot format taken from GunController: { originHeadPos, hitPos, hitPart }
+-- Prison Life shoot remote. Verified format (GunController): ShootEvent:FireServer({ shot, ... })
+-- where each shot = { originHeadPos, hitPosition, hitInstance }. Silent aim hooks this below.
 local ShootEventRemote
 pcall(function()
-    local gr=game:GetService("ReplicatedStorage"):FindFirstChild("GunRemotes")
-    ShootEventRemote=gr and gr:FindFirstChild("ShootEvent")
+    local rs=game:GetService("ReplicatedStorage")
+    local gr=rs:FindFirstChild("GunRemotes") or rs:WaitForChild("GunRemotes",5)
+    ShootEventRemote=gr and (gr:FindFirstChild("ShootEvent") or gr:WaitForChild("ShootEvent",5))
 end)
+
+-- SILENT AIM (real): hook the game's own shoot remote and rewrite YOUR shot so its hit position +
+-- hit instance become the target. No extra shot is sent (that only stacked damage) — your actual
+-- bullet is retargeted. We touch ONLY ShootEvent FireServer calls, only while Silent is enabled,
+-- and otherwise pass every namecall straight through, so the gun can't break.
+do
+    local hookmeta=hookmetamethod
+    local getnc=getnamecallmethod
+    local ischeck=checkcaller
+    local wrapcc=newcclosure or function(f) return f end
+    if hookmeta and getnc and ShootEventRemote then
+        local oldNC
+        oldNC=hookmeta(game,"__namecall",wrapcc(function(self,...)
+            if F.Aim.Silent and attached and self==ShootEventRemote
+               and (not ischeck or not ischeck()) and getnc()=="FireServer" then
+                local shots=...
+                if type(shots)=="table" then
+                    local ok,t=pcall(Aim.getTarget,F.Aim.FOV,F.Aim.WallCheck)
+                    if ok and t then
+                        for _,e in ipairs(shots) do
+                            if type(e)=="table" then e[2]=t.Position; e[3]=t end
+                        end
+                    end
+                end
+            end
+            return oldNC(self,...)
+        end))
+        Hub._silentHook=true
+    end
+end
+
+--== RAGE ===========================================================================
+-- Verified live: Prison Life only applies damage when the server sees you (a) holding a gun and
+-- (b) CLOSE to the victim (it range/LOS-checks every shot). So rage arms up, teleports ONTO the
+-- target, then spams the shoot remote at their head until they drop, then teleports you home.
+local GiverRemote, ReloadRemote
+pcall(function()
+    local rem=game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    GiverRemote=rem and rem:FindFirstChild("GiverPressed")
+    ReloadRemote=ShootEventRemote and ShootEventRemote.Parent and ShootEventRemote.Parent:FindFirstChild("FuncReload")
+end)
+-- reload exactly like the game does (set a session, invoke the reload remote, wait ReloadTime, refill)
+local function reloadGun(tool)
+    if not (tool and ReloadRemote) then return end
+    pcall(function()
+        local sess=tick()
+        tool:SetAttribute("Local_ReloadSession", sess)
+        task.spawn(function() ReloadRemote:InvokeServer() end)
+        task.wait(tool:GetAttribute("ReloadTime") or 2)
+        tool:SetAttribute("Local_CurrentAmmo", tool:GetAttribute("MaxAmmo") or 30)
+        tool:SetAttribute("Local_ReloadSession", 0)
+    end)
+end
+local function heldGun()
+    local c=char(); if c then for _,t in ipairs(c:GetChildren()) do if t:IsA("Tool") then return t,true end end end
+    local bp=LocalPlayer:FindFirstChild("Backpack")
+    if bp then for _,t in ipairs(bp:GetChildren()) do if t:IsA("Tool") then return t,false end end end
+    return nil
+end
+local function findGiver()
+    local team=(LocalPlayer.Team and LocalPlayer.Team.Name or ""):lower()
+    local want = team:find("guard") and "Remington 870" or "AK-47"
+    local fallback
+    for _,d in ipairs(Workspace:GetDescendants()) do
+        local tn=d:GetAttribute("ToolName")
+        if tn then
+            local part=d:IsA("BasePart") and d or d:FindFirstChildWhichIsA("BasePart",true)
+            if part then
+                if tn==want then return part end
+                local low=tostring(tn):lower()
+                if not fallback and (low:find("ak") or low:find("rifle") or low:find("gun") or low:find("pistol") or low:find("m9") or low:find("smg") or low:find("remington")) then fallback=part end
+            end
+        end
+    end
+    return fallback
+end
+-- ensure a gun is equipped; if you have none, grab one from the armory (this also escapes an inmate)
+local function armUp()
+    local g,equipped=heldGun()
+    if g then if not equipped then pcall(function() hum():EquipTool(g) end) end; return true end
+    local giver=findGiver(); local r=root()
+    if giver and r and GiverRemote then
+        local save=r.CFrame
+        pcall(function() r.CFrame=CFrame.new(giver.Position+Vector3.new(0,2.5,0)) end)
+        task.wait(0.3)
+        pcall(function() GiverRemote:FireServer(giver) end)
+        pcall(function() if giver.Parent then GiverRemote:FireServer(giver.Parent) end end)
+        task.wait(0.3)
+        pcall(function() r.CFrame=save end)
+        task.wait(0.2)
+    end
+    g,equipped=heldGun()
+    if g then if not equipped then pcall(function() hum():EquipTool(g) end) end; return true end
+    return false
+end
+local raging=false
+Hub._raging=function() return raging end
+-- kick-safe rage: fire at the gun's REAL fire rate, track ammo, reload before the mag empties, and
+-- never overfire. The earlier version sprayed 0.06s / ~78 rounds with no reload, which tripped the
+-- anti-exploit (kick) and desynced the ammo counter (broke the weapon). One mag kills easily.
+local function doRage(target)
+    if raging or not (target and target.Parent) or not ShootEventRemote then return end
+    raging=true
+    task.spawn(function()
+        pcall(function()
+            local r=root(); if not r then raging=false; return end
+            local home=r.CFrame
+            if not armUp() then raging=false; return end
+            task.wait(0.15)
+            local tool=char() and char():FindFirstChildOfClass("Tool")
+            if not tool then raging=false; return end
+            local fireRate=tool:GetAttribute("FireRate") or 0.12
+            local interval=math.max(fireRate,0.09)+0.02      -- stay at/above the legit cadence
+            local maxAmmo=tool:GetAttribute("MaxAmmo") or 20
+            local ammo=tool:GetAttribute("Local_CurrentAmmo") or maxAmmo
+            if ammo<12 then reloadGun(tool) end               -- top up first if the mag is low
+            local tc=target.Character
+            local troot=tc and (tc:FindFirstChild("HumanoidRootPart") or tc:FindFirstChild("Torso"))
+            local thum=tc and tc:FindFirstChildOfClass("Humanoid")
+            if not (troot and thum and thum.Health>0) then raging=false; return end
+            tweenTP(troot.CFrame*CFrame.new(0,0,3.2), 0.2)    -- smooth blink behind them
+            task.wait(0.08)
+            local fired=0
+            while thum and thum.Parent and thum.Health>0 and fired<28 do
+                local thead=tc and tc:FindFirstChild("Head"); if not thead then break end
+                local mh=char() and char():FindFirstChild("Head")
+                local o=(mh and mh.Position) or thead.Position
+                pcall(function() ShootEventRemote:FireServer({ { o, thead.Position, thead } }) end)
+                fired=fired+1
+                local left=(tool:GetAttribute("Local_CurrentAmmo") or maxAmmo)-1
+                pcall(function() tool:SetAttribute("Local_CurrentAmmo", left) end)
+                if left<=1 then reloadGun(tool) end            -- reload before it hits zero
+                task.wait(interval)
+                local ntr=tc and (tc:FindFirstChild("HumanoidRootPart") or tc:FindFirstChild("Torso"))
+                local rr=root()
+                if ntr and rr and (rr.Position-ntr.Position).Magnitude>9 then tweenTP(ntr.CFrame*CFrame.new(0,0,3.2),0.12) end  -- restick to a runner
+            end
+            tweenTP(home, 0.2)                                 -- glide back
+        end)
+        raging=false
+    end)
+end
+Hub._rage=doRage
+
+--== SERVER-SIDE INVIS (decoy method) ===============================================
+-- You control an invisible client-only CLONE while the server keeps your real body where it was —
+-- so OTHER players stop seeing you move (they see a frozen copy at the spot you toggled it on). In a
+-- FilteringEnabled game this is the only way others lose sight of you while you stay alive & in
+-- control: plain Transparency never replicates, and detaching your body kills the Humanoid (tested).
+local invisState
+local function applyServerInvis(on)
+    pcall(function()
+        if on then
+            if invisState then return end
+            local realCh=LocalPlayer.Character
+            local h=realCh and realCh:FindFirstChildOfClass("Humanoid")
+            local hrp=realCh and realCh:FindFirstChild("HumanoidRootPart")
+            if not (realCh and h and hrp) then return end
+            local savedCF=hrp.CFrame
+            realCh.Archivable=true
+            local clone=realCh:Clone()
+            realCh.Archivable=false
+            clone.Parent=Workspace
+            local ch2=clone:FindFirstChild("HumanoidRootPart")
+            if ch2 then ch2.CFrame=savedCF end
+            LocalPlayer.Character=clone
+            local h2=clone:FindFirstChildOfClass("Humanoid")
+            if h2 then cam().CameraSubject=h2 end
+            invisState={clone=clone,real=realCh}
+        else
+            if not invisState then return end
+            local clone=invisState.clone; local realCh=invisState.real; invisState=nil
+            local dest
+            local ch2=clone and clone:FindFirstChild("HumanoidRootPart")
+            if ch2 then dest=ch2.CFrame end
+            if realCh and realCh.Parent then
+                LocalPlayer.Character=realCh
+                local rh=realCh:FindFirstChild("HumanoidRootPart")
+                if rh and dest then rh.CFrame=dest end
+                local rhh=realCh:FindFirstChildOfClass("Humanoid")
+                if rhh then cam().CameraSubject=rhh end
+            end
+            if clone then clone:Destroy() end
+        end
+    end)
+end
+Hub._serverInvis=applyServerInvis
 
 local BONES={ {"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},{"Torso","Left Leg"},{"Torso","Right Leg"} }
 local ESP = {}
 do
-    local hasDraw=(typeof(Drawing)=="table") or (Drawing~=nil)
-    local host=(gethui and gethui()) or CoreGui
+    -- some executors expose a broken/partial Drawing; verify it actually CONSTRUCTS before trusting
+    -- it, else fall back to Highlight so ESP renders on ANY executor (this is the cross-exec fix).
+    local hasDraw=false
+    if Drawing and Drawing.new then
+        local ok,probe=pcall(Drawing.new,"Square")
+        if ok and probe then hasDraw=true; pcall(function() probe:Remove() end) end
+    end
+    local host=CoreGui
+    if gethui then local ok,h=pcall(gethui); if ok and h then host=h end end
+    host=host or LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local pool={}
     local function nd(k,pr) local d=Drawing.new(k); for a,b in pairs(pr) do d[a]=b end; return d end
     local function build(p)
         if hasDraw then
-            local bones={}; for i=1,#BONES do bones[i]=nd("Line",{Thickness=1,Color=Color3.new(1,1,1)}) end
-            pool[p]={ box=nd("Square",{Thickness=1,Filled=false,Color=Color3.new(1,1,1)}),
-                boxo=nd("Square",{Thickness=3,Filled=false,Color=Color3.new(0,0,0)}),
-                name=nd("Text",{Size=13,Center=true,Outline=true,Color=Color3.new(1,1,1)}),
-                dist=nd("Text",{Size=12,Center=true,Outline=true,Color=Color3.fromRGB(190,190,190)}),
-                trac=nd("Line",{Thickness=1,Color=Color3.fromRGB(255,95,95)}),
-                hpbg=nd("Square",{Thickness=1,Filled=true,Color=Color3.fromRGB(15,15,15)}),
-                hp=nd("Square",{Thickness=1,Filled=true,Color=Color3.fromRGB(90,230,150)}), bones=bones }
-        else
-            local hl=Instance.new("Highlight"); hl.FillTransparency=0.55; hl.OutlineColor=Color3.fromRGB(255,95,95)
-            hl.FillColor=Color3.fromRGB(255,95,95); hl.Adornee=p.Character; hl.Parent=host; pool[p]={hl=hl}
+            local ok=pcall(function()
+                local bones={}; for i=1,#BONES do bones[i]=nd("Line",{Thickness=1,Color=Color3.new(1,1,1)}) end
+                pool[p]={ box=nd("Square",{Thickness=1,Filled=false,Color=Color3.new(1,1,1)}),
+                    boxo=nd("Square",{Thickness=3,Filled=false,Color=Color3.new(0,0,0)}),
+                    name=nd("Text",{Size=13,Center=true,Outline=true,Color=Color3.new(1,1,1)}),
+                    dist=nd("Text",{Size=12,Center=true,Outline=true,Color=Color3.fromRGB(190,190,190)}),
+                    trac=nd("Line",{Thickness=1,Color=Color3.fromRGB(255,95,95)}),
+                    hpbg=nd("Square",{Thickness=1,Filled=true,Color=Color3.fromRGB(15,15,15)}),
+                    hp=nd("Square",{Thickness=1,Filled=true,Color=Color3.fromRGB(90,230,150)}), bones=bones }
+            end)
+            if ok and pool[p] then return end
+            hasDraw=false; pool[p]=nil  -- Drawing threw mid-build → drop to Highlight for everyone
+        end
+        local ok2,hl=pcall(Instance.new,"Highlight")
+        if ok2 and hl then
+            hl.FillTransparency=0.55; hl.OutlineColor=Color3.fromRGB(255,95,95)
+            hl.FillColor=Color3.fromRGB(255,95,95); hl.Adornee=p.Character
+            pcall(function() hl.Parent=host end); pool[p]={hl=hl}
         end
     end
     local function hide(o)
@@ -207,6 +434,25 @@ local function stopNoclip()
     if c then for _,v in ipairs(c:GetDescendants()) do if v:IsA("BasePart") and v.Name~="HumanoidRootPart" then v.CanCollide=true end end end
 end
 
+-- local invisibility: hides YOUR body on your own client. Transparency changes don't replicate,
+-- so this is client-side only (enemies still see you). Fully reversible — restores original values.
+local invisSaved
+local function applyInvis(on)
+    local c=char(); if not c then return end
+    if on then
+        invisSaved=invisSaved or {}
+        for _,d in ipairs(c:GetDescendants()) do
+            if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
+                if invisSaved[d]==nil then invisSaved[d]=d.Transparency end
+                d.Transparency=1
+            end
+        end
+    else
+        if invisSaved then for d,t in pairs(invisSaved) do if d and d.Parent then pcall(function() d.Transparency=t end) end end end
+        invisSaved=nil
+    end
+end
+
 local fbState
 local function fullbright(on)
     if on then
@@ -258,15 +504,28 @@ pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
 local WIN_W,WIN_H=600,470
 local win=make("Frame",{Size=UDim2.fromOffset(WIN_W,WIN_H),Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2),BackgroundColor3=T.bg,BorderSizePixel=0,ClipsDescendants=true},gui)
 corner(win,7); stroke(win,T.line,1)
+local curW,curH=WIN_W,WIN_H
 
---== falling gray boxes background ==--
-local bgHost=make("Frame",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ZIndex=0},win)
+-- resize grip (bottom-right). Layout is mostly scale-based, so children reflow as the window grows.
+local rez=make("Frame",{Size=UDim2.fromOffset(14,14),Position=UDim2.new(1,-16,1,-16),BackgroundColor3=T.line,BackgroundTransparency=0.25,BorderSizePixel=0,ZIndex=60,Active=true},win); corner(rez,3)
+do local rz,rs,rsz
+    rez.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then rz=true; rs=Vector2.new(i.Position.X,i.Position.Y); rsz=win.AbsoluteSize end end)
+    bind(UIS.InputChanged,function(i) if rz and i.UserInputType==Enum.UserInputType.MouseMovement then
+        local d=Vector2.new(i.Position.X,i.Position.Y)-rs
+        curW=math.clamp(math.floor(rsz.X+d.X),430,1000); curH=math.clamp(math.floor(rsz.Y+d.Y),300,760)
+        win.Size=UDim2.fromOffset(curW,curH) end end)
+    bind(UIS.InputEnded,function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then rz=false end end)
+end
+
+--== falling boxes: render OVER content as a faint overlay so the fall is always visible
+--   (at ZIndex 0 they were hidden behind every opaque panel — that's why they looked frozen). ==--
+local bgHost=make("Frame",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ZIndex=8},win)
 local boxes={}
-for i=1,15 do
-    local sz=math.random(8,22)
-    local b=make("Frame",{Size=UDim2.fromOffset(sz,sz),Position=UDim2.fromOffset(math.random(0,WIN_W),math.random(-WIN_H,WIN_H)),BackgroundColor3=Color3.fromRGB(72,72,80),BackgroundTransparency=0.82,BorderSizePixel=0,ZIndex=0,Rotation=math.random(0,45)},bgHost)
+for i=1,22 do
+    local sz=math.random(7,20)
+    local b=make("Frame",{Size=UDim2.fromOffset(sz,sz),Position=UDim2.fromOffset(math.random(0,WIN_W),math.random(-WIN_H,WIN_H)),BackgroundColor3=Color3.fromRGB(120,120,132),BackgroundTransparency=0.86,BorderSizePixel=0,ZIndex=8,Rotation=math.random(0,45)},bgHost)
     corner(b,3)
-    boxes[i]={f=b,spd=math.random(14,42),x=b.Position.X.Offset,y=b.Position.Y.Offset}
+    boxes[i]={f=b,spd=math.random(16,46),x=b.Position.X.Offset,y=b.Position.Y.Offset}
 end
 
 local titleBar=make("Frame",{Size=UDim2.new(1,0,0,34),BackgroundColor3=T.title,BorderSizePixel=0},win)
@@ -339,37 +598,11 @@ local function section(par,title)
     return s
 end
 
---== footer + attach (bigger) ==--
+--== footer (status only — features are always live, no attach step) ==--
 local footer=make("Frame",{Size=UDim2.new(1,0,0,34),Position=UDim2.new(0,0,1,-34),BackgroundColor3=T.title,BorderSizePixel=0},win)
 make("Frame",{Size=UDim2.new(1,0,0,1),BackgroundColor3=T.line,BorderSizePixel=0},footer)
-local dot=make("Frame",{Size=UDim2.fromOffset(8,8),Position=UDim2.fromOffset(16,13),BackgroundColor3=Color3.fromRGB(230,70,70),BorderSizePixel=0},footer); corner(dot,4)
-local statusTxt=make("TextLabel",{Size=UDim2.new(1,-190,1,0),Position=UDim2.fromOffset(32,0),BackgroundTransparency=1,Font=FONT,Text="Detached   ·   "..LocalPlayer.Name.."   ·   Prison Life",TextColor3=T.sub,TextXAlignment=Enum.TextXAlignment.Left,TextSize=12},footer)
-local attachBtn=make("TextButton",{Size=UDim2.fromOffset(126,24),Position=UDim2.new(1,-138,0.5,-12),BackgroundColor3=T.accent,BorderSizePixel=0,AutoButtonColor=false,Font=BOLD,Text="Attach",TextColor3=Color3.fromRGB(250,250,252),TextSize=13},footer); corner(attachBtn,5)
-reg(attachBtn,"BackgroundColor3")
-local function setAttached(v)
-    attached=v
-    tw(dot,0.15,{BackgroundColor3=v and T.green or Color3.fromRGB(230,70,70)})
-    statusTxt.Text=(v and "Attached" or "Detached").."   ·   "..LocalPlayer.Name.."   ·   Prison Life"
-    attachBtn.Text=v and "Detach" or "Attach"
-    tw(attachBtn,0.15,{BackgroundColor3=v and T.green or T.accent})
-end
-local attaching=false
-attachBtn.MouseButton1Click:Connect(function()
-    if attaching then return end
-    if attached then setAttached(false); return end
-    attaching=true; attachBtn.Text="• • •"
-    tw(attachBtn,0.15,{BackgroundColor3=Color3.fromRGB(235,180,60)})
-    tw(dot,0.15,{BackgroundColor3=Color3.fromRGB(240,185,60)})
-    local nm=LocalPlayer.Name
-    task.spawn(function()
-        statusTxt.Text="Scanning process   ·   "..nm; task.wait(0.8)
-        statusTxt.Text="Injecting   ·   "..nm; task.wait(1.0)
-        statusTxt.Text="Attaching   ·   "..nm; task.wait(0.9)
-        attaching=false; setAttached(true)
-    end)
-end)
-attachBtn.MouseEnter:Connect(function() if not attaching then tw(attachBtn,0.12,{BackgroundTransparency=0.12}) end end)
-attachBtn.MouseLeave:Connect(function() if not attaching then tw(attachBtn,0.12,{BackgroundTransparency=0}) end end)
+local dot=make("Frame",{Size=UDim2.fromOffset(8,8),Position=UDim2.fromOffset(16,13),BackgroundColor3=T.green,BorderSizePixel=0},footer); corner(dot,4)
+make("TextLabel",{Size=UDim2.new(1,-24,1,0),Position=UDim2.fromOffset(32,0),BackgroundTransparency=1,Font=FONT,Text=LocalPlayer.Name.."   ·   Prison Life",TextColor3=T.sub,TextXAlignment=Enum.TextXAlignment.Left,TextSize=12},footer)
 
 --== controls ==--
 local function toggle(p,text,get,set)
@@ -588,12 +821,12 @@ end
 do
     local pg=addTab("Aimbot")
     local sA=section(pg.left,"Aimbot")
-    toggle(sA,"Enabled (hold RMB)",function() return F.Aim.On end,function(v) F.Aim.On=v end)
+    toggle(sA,"Enabled (auto-latch)",function() return F.Aim.On end,function(v) F.Aim.On=v end)
     dropdown(sA,"Enemies",function() return ENEMY_MODES end,function() return ENEMY_MODES[enemyMode] end,function(i) enemyMode=i end)
     dropdown(sA,"Target part",function() return {"Head","Torso"} end,function() return F.Aim.Part end,function(_,opt) F.Aim.Part=opt end)
     toggle(sA,"Wall check (visible only)",function() return F.Aim.WallCheck end,function(v) F.Aim.WallCheck=v end)
     toggle(sA,"Wallbang (lock thru walls)",function() return wallbang end,function(v) wallbang=v end)
-    toggle(sA,"Silent aim (no hook, click to fire)",function() return F.Aim.Silent end,function(v) F.Aim.Silent=v end)
+    toggle(sA,"Silent aim (retargets your shots)",function() return F.Aim.Silent end,function(v) F.Aim.Silent=v end)
     toggle(sA,"Triggerbot (auto-fire)",function() return F.Aim.Trigger end,function(v) F.Aim.Trigger=v end)
     toggle(sA,"Show FOV circle",function() return F.Aim.ShowFOV end,function(v) F.Aim.ShowFOV=v end)
     local sT=section(pg.right,"Tuning")
@@ -638,22 +871,28 @@ do
         plTarget=Players:FindFirstChild(name); refreshInfo() end)
     button(sT,"Refresh info",refreshInfo)
     local sAc=section(pg.right,"Actions")
+    button(sAc,"RAGE  —  arm + TP + kill target",function()
+        if not plTarget then return end
+        if Hub._raging and Hub._raging() then return end
+        doRage(plTarget)
+    end)
+    label(sAc,"grabs a gun if unarmed, blinks onto them, empties into their head")
     button(sAc,"Spectate (toggle)",function()
         if spectating then stopSpectate(); return end
         if not plTarget then return end
         spectateTarget=plTarget; spectating=true
     end)
     button(sAc,"Stop spectating",stopSpectate)
-    button(sAc,"TP in front",function() local r=root(); local tr=tgtRoot(); if r and tr then r.CFrame=tr.CFrame*CFrame.new(0,0,-3) end end)
-    button(sAc,"TP behind",function() local r=root(); local tr=tgtRoot(); if r and tr then r.CFrame=tr.CFrame*CFrame.new(0,0,3) end end)
-    button(sAc,"TP on top",function() local r=root(); local tr=tgtRoot(); if r and tr then r.CFrame=tr.CFrame*CFrame.new(0,4,0) end end)
+    button(sAc,"TP in front",function() local tr=tgtRoot(); if tr then tpMove(tr.CFrame*CFrame.new(0,0,-3)) end end)
+    button(sAc,"TP behind",function() local tr=tgtRoot(); if tr then tpMove(tr.CFrame*CFrame.new(0,0,3)) end end)
+    button(sAc,"TP on top",function() local tr=tgtRoot(); if tr then tpMove(tr.CFrame*CFrame.new(0,4,0)) end end)
     toggle(sAc,"Follow target",function() return plFollow end,function(v) plFollow=v end)
     Hub._tgtRoot=tgtRoot
 end
 
---== MOVEMENT ==--
+--== CHARACTER ==--
 do
-    local pg=addTab("Movement")
+    local pg=addTab("Character")
     local sS=section(pg.left,"Speed / Jump")
     toggle(sS,"Speed",function() return F.Mov.Speed end,function(v) F.Mov.Speed=v; local h=hum(); if h and not v then h.WalkSpeed=16 end end)
     slider(sS,"Walk speed",16,250,function() return F.Mov.SpeedV end,function(v) F.Mov.SpeedV=v end)
@@ -664,6 +903,13 @@ do
     slider(sF,"Fly speed",0.5,10,function() return F.Mov.FlyV end,function(v) F.Mov.FlyV=v end)
     toggle(sF,"Noclip (pair with Fly)",function() return F.Mov.Noclip end,function(v) F.Mov.Noclip=v; if v then applyNoclip() else stopNoclip() end end)
     toggle(sF,"Infinite jump",function() return F.Mov.InfJump end,function(v) F.Mov.InfJump=v end)
+    -- INVISIBLE — REMOVED. It does not work in Prison Life. Every method was tried live:
+    --   • local transparency only hides your OWN screen — other players still see you.
+    --   • making others lose sight of you is impossible here without breaking you:
+    --       detaching your body KILLS the Humanoid; keeping it alive DRAGS you out of the map;
+    --       the invisible-clone swap FREEZES your controls (needs a full rejoin to recover).
+    -- There is no working server-side invis for this FE game, so the toggle is gone on purpose.
+    label(sF,"Invisible:  not possible in this game — removed (see note in code)")
 end
 
 --== WORLD ==--
@@ -727,7 +973,7 @@ end
 --== TELEPORT ==--
 do
     local pg=addTab("Teleport")
-    local function tp(pos) local r=root(); if r then r.CFrame=CFrame.new(pos) end end
+    local function tp(pos) tpMove(CFrame.new(pos)) end
     local sLoc=section(pg.left,"Locations")
     button(sLoc,"Criminal Base",function() tp(Vector3.new(-975,106,2058)) end)
     button(sLoc,"Criminal Armory",function() tp(Vector3.new(-928,93,2038)) end)
@@ -745,7 +991,7 @@ do
         local wp=r.CFrame; wpCount=wpCount+1; local id=wpCount
         local row=make("Frame",{Size=UDim2.new(1,0,0,26),BackgroundColor3=T.item,BorderSizePixel=0},sWp); corner(row,4); stroke(row,T.line,1)
         local tpb=make("TextButton",{Size=UDim2.new(1,-32,1,0),Position=UDim2.fromOffset(10,0),BackgroundTransparency=1,Font=FONT,Text="› Waypoint "..id,TextColor3=T.text,TextXAlignment=Enum.TextXAlignment.Left,TextSize=12},row)
-        tpb.MouseButton1Click:Connect(function() local rr=root(); if rr then rr.CFrame=wp end end)
+        tpb.MouseButton1Click:Connect(function() tpMove(wp) end)
         local del=make("TextButton",{Size=UDim2.fromOffset(22,18),Position=UDim2.new(1,-26,0.5,-9),BackgroundColor3=T.off,BorderSizePixel=0,AutoButtonColor=false,Font=FONT,Text="X",TextColor3=T.text,TextSize=11},row); corner(del,4)
         del.MouseEnter:Connect(function() tw(del,0.12,{BackgroundColor3=Color3.fromRGB(180,60,60)}) end)
         del.MouseLeave:Connect(function() tw(del,0.12,{BackgroundColor3=T.off}) end)
@@ -793,9 +1039,10 @@ do
     toggle(sC,"RGB accent (gamer mode)",function() return F.UI.RGB end,function(v) F.UI.RGB=v end)
 
     local sI=section(pg.right,"Info / Controls")
-    label(sI,"syntax   ·   v5.5")
+    label(sI,"syntax   ·   v5.8")
     label(sI,"Toggle UI:  Right Shift")
-    label(sI,"Aimbot hold:  Right Mouse")
+    label(sI,"Rage:  Players tab → select → RAGE (kick-safe)")
+    label(sI,"Aimbot:  auto-latch (toggle on)")
     label(sI,"Click-TP:  T")
     label(sI,"Fly:  WASD + Space/Ctrl")
     button(sI,"Unload",function() Hub._unload() end)
@@ -808,20 +1055,21 @@ local minimized=false
 minB.MouseButton1Click:Connect(function()
     minimized=not minimized; tabBar.Visible=not minimized; body.Visible=not minimized; footer.Visible=not minimized
     bgHost.Visible=(not minimized) and F.UI.Boxes; underline.Visible=not minimized
-    tw(win,0.2,{Size=minimized and UDim2.fromOffset(WIN_W,34) or UDim2.fromOffset(WIN_W,WIN_H)},Enum.EasingStyle.Quart)
+    tw(win,0.2,{Size=minimized and UDim2.fromOffset(curW,34) or UDim2.fromOffset(curW,curH)},Enum.EasingStyle.Quart)
     minB.Text=minimized and "+" or "—" end)
 closeB.MouseButton1Click:Connect(function() Hub._unload() end)
 
-if (typeof(Drawing)=="table") or (Drawing~=nil) then
+pcall(function()
+    if not (Drawing and Drawing.new) then return end
     fovCircle=Drawing.new("Circle"); fovCircle.Thickness=1; fovCircle.NumSides=52; fovCircle.Color=T.accent; fovCircle.Filled=false; fovCircle.Visible=false
-end
+end)
 
 bind(UIS.InputBegan,function(i,gpe)
     if i.UserInputType==Enum.UserInputType.MouseButton2 then F.Aim.Held=true end
     if gpe then return end
     if i.UserInputType==Enum.UserInputType.MouseButton1 then F.Aim.Fire=true end
     if i.KeyCode==Enum.KeyCode.RightShift then win.Visible=not win.Visible end
-    if i.KeyCode==Enum.KeyCode.T then local r=root(); local m=LocalPlayer:GetMouse(); if r and m.Hit then r.CFrame=CFrame.new(m.Hit.Position+Vector3.new(0,3,0)) end end
+    if i.KeyCode==Enum.KeyCode.T then local m=LocalPlayer:GetMouse(); if m.Hit then tpMove(CFrame.new(m.Hit.Position+Vector3.new(0,3,0))) end end
     if F.Mov.InfJump and i.KeyCode==Enum.KeyCode.Space then local h=hum(); if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end end
 end)
 bind(UIS.InputEnded,function(i)
@@ -832,7 +1080,12 @@ end)
 pcall(function() local vu=game:GetService("VirtualUser")
     bind(LocalPlayer.Idled,function() if F.Wld.AntiAFK then vu:CaptureController(); vu:ClickButton2(Vector2.new()) end end) end)
 
-bind(LocalPlayer.CharacterAdded,function() task.wait(0.4); if F.Mov.Noclip then applyNoclip() end; if spectating then stopSpectate() end end)
+bind(LocalPlayer.CharacterAdded,function()
+    task.wait(0.4); invisSaved=nil
+    if F.Mov.Noclip then applyNoclip() end
+    if F.Mov.Invis then applyInvis(true) end
+    if spectating then stopSpectate() end
+end)
 
 bind(RunService.Stepped,function()
     if attached and F.Mov.Noclip then local c=char()
@@ -863,23 +1116,20 @@ bind(RunService.RenderStepped,function(dt)
     pcall(applyMovement,dt)
     if F.Wld.NoFog then Lighting.FogEnd=1e9 end
     if plFollow and Hub._tgtRoot then local r=root(); local tr=Hub._tgtRoot(); if r and tr then r.CFrame=tr.CFrame*CFrame.new(0,0,3.5) end end
-    if fovCircle then fovCircle.Visible=F.Aim.On and F.Aim.ShowFOV; fovCircle.Radius=F.Aim.FOV; fovCircle.Position=cam().ViewportSize/2 end
-    if F.Aim.On and F.Aim.Held then local t=wallbang and wallTarget() or Aim.getTarget()
+    if fovCircle then fovCircle.Visible=F.Aim.On and F.Aim.ShowFOV; fovCircle.Radius=F.Aim.FOV; fovCircle.Position=aimOrigin() end
+    if F.Aim.On then local t=wallbang and wallTarget() or Aim.getTarget()
         if t then local aimPos=t.Position+t.AssemblyLinearVelocity*F.Aim.Predict
             local cf=cam().CFrame; cam().CFrame=cf:Lerp(CFrame.new(cf.Position,aimPos),1-F.Aim.Smooth) end end
     if F.Aim.Trigger and (os.clock()-lastFire)*1000>=F.Aim.TrigDelay then
         local t=Aim.getTarget(10,true); if t then lastFire=os.clock(); fireClick() end end
-    -- silent aim: while firing, send a shot straight at the target via the remote (no hook, gun-safe)
-    if F.Aim.Silent and F.Aim.Fire and ShootEventRemote and (os.clock()-lastSilent)*1000>=math.max(F.Aim.TrigDelay,80) then
-        local c=char(); local myHead=c and c:FindFirstChild("Head"); local gun=c and c:FindFirstChildOfClass("Tool")
-        if myHead and gun then local t=Aim.getTarget(F.Aim.FOV,false)
-            if t then lastSilent=os.clock(); pcall(function() ShootEventRemote:FireServer({ {myHead.Position,t.Position,t} }) end) end end
-    end
+    -- silent aim is handled by the ShootEvent hook (top of file): it rewrites your real shot in
+    -- place, so there is nothing to do per-frame here and no extra shot is ever sent.
 end)
 bind(Players.PlayerRemoving,function(p) pcall(function() ESP.clear(p) end); if p==plTarget then plTarget=nil; plFollow=false end end)
 
 function Hub._unload()
     for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    pcall(function() applyServerInvis(false) end)
     pcall(clearNoclip); pcall(ESP.destroy); pcall(stopSpectate)
     if fovCircle then pcall(function() fovCircle:Remove() end) end
     pcall(function() fullbright(false) end); pcall(function() cam().FieldOfView=70 end)
@@ -889,4 +1139,4 @@ function Hub._unload()
 end
 Hub.Aim=Aim
 
-warn("[syntax] v5.5 loaded — click Attach, then Right Shift to toggle UI")
+warn("[syntax] v5.8 loaded — Right Shift toggles UI · Players→RAGE to kill a target · smooth TPs"..(Hub._silentHook and "" or "   [note: silent aim unavailable — executor lacks hookmetamethod]"))
